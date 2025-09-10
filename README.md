@@ -1,7 +1,7 @@
 # NP-RWG — Concurrent Connection-Oriented（Shared Memory + FIFO 版）
 
-> 這個版本在前一個Project（`np_simple` / `np_single_proc`）基礎上，**只描述新差異**：
-> - 仍是 **connection-oriented + fork-per-client** 的併發伺服器。
+> 這個版本在前一個Project（`np_simple` / `np_single_proc`）基礎上， 但改為Shared Memory + FIFO：
+> - 同樣是 **connection-oriented + fork-per-client** 的Concurrent 伺服器。
 > - 新增 **共享記憶體（System V SHM）** 管理多人狀態與訊息佇列。
 > - 以 **Named FIFO（有名管道）** 實作跨使用者的 User Pipe。
 > - 透過 **訊號**（`SIGUSR1` / `SIGUSR2`）做跨行程通知（廣播/私訊、FIFO 就緒）。
@@ -10,7 +10,7 @@
 
 ---
 
-## 新功能
+## 功能
 - **共享記憶體（SHM）**：
   - `USERS_KEY=1111`：`usersInfo[1..30]`，保存 `exist/pid/ip:port/name`。
   - `MSG_KEY=2222`：`char msg[MAXLINE]`，用來暫存一次性廣播/私訊內容。
