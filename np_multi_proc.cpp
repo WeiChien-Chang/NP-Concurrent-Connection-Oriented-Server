@@ -649,6 +649,8 @@ void parentProcess(int i,
     }
 }
 
+// 把一行（已用 ParseInput 切好的）指令序列 cmd 實際執行起來，完整處理: 一般管線（|）, 檔案重導（>）, 使用者管線（<k / >k，跨使用者以 FIFO 傳遞）, 與「編號管線」對接
+// 依序為每段子指令建立必要的管線、fork/exec 子程序，把 stdin/stdout（與必要時的 stderr）接好，最後做回收與復原。
 void ExecuteCommand(vector<vector<string>> &cmd, int pipeTime, string &line, int userId)
 {
     int numOrdinaryPipe = cmd.size() - 1, fd = -1;
@@ -702,14 +704,17 @@ void ExecuteCommand(vector<vector<string>> &cmd, int pipeTime, string &line, int
             }
         }
 
+		// 處理 <k（接收、當前段 STDIN）
+		// hasUserPipeInput（bool）：解析 cmd[i] 這段指令時，如果最後一個或倒數第二個 token 是 "<k"（例如 cat <3），就把它設為 true。
+		// UserPipeSrcId（int）：把 <k 裡面的 k 取出來存這裡（用 sscanf(cmd[i][...].substr(1).c_str(), "%d", &UserPipeSrcId)）。代表來源使用者的 ID
         if (hasUserPipeInput && UserPipeSrcId != 0)
         {
-            cmd[i].pop_back();    // 移除 >3
+            cmd[i].pop_back();    // 移除 <3
             if (!usersData[UserPipeSrcId].exist)
             {
                 cerr << "*** Error: user #" << UserPipeSrcId << " does not exist yet. ***" << '\n';
             }
-            // 處理 <2 cat 但user #2 並沒有對使用過 >N的情況 Ex: *** Error: the pipe #<sender_id>->#<receiver_id> does not exist yet. ***
+            // 處理 <2 cat 但user #2 並沒有使用過 >N的情況 Ex: *** Error: the pipe #<sender_id>->#<receiver_id> does not exist yet. ***
             else if (userPipes[UserPipeSrcId].fd[userId] == PIPE_NOT_EXIST)
             {
                 cerr << "*** Error: the pipe #" << UserPipeSrcId << "->#" << userId << " does not exist yet. ***" << '\n';
@@ -742,9 +747,12 @@ void ExecuteCommand(vector<vector<string>> &cmd, int pipeTime, string &line, int
             }
         }
 
+		// 處理 >k（傳送、當前段 STDOUT）
+		// hasUserPipeOutput（bool）解析 cmd[i] 這段時，如果最後一個或倒數第二個 token 是 ">k"（例如 ls | cat >3、或 echo hi >3 cat 這類你保留到段尾的情況），就把它設成 true。
+		// UserPipeDstId（int）從 ">k" 取出的 k，代表目標使用者的 ID
         if (hasUserPipeOutput && UserPipeDstId != 0)
         {
-            cmd[i].pop_back();    // 移除 <3
+            cmd[i].pop_back();    // 移除 >3
             if (!usersData[UserPipeDstId].exist)
             {
                 cerr << "*** Error: user #" << UserPipeDstId << " does not exist yet. ***" << '\n';
@@ -807,10 +815,15 @@ void ExecuteCommand(vector<vector<string>> &cmd, int pipeTime, string &line, int
     }
 
     // 最後一條指令的處理
+	// 指令尾端有 >k, 需要把最後一個子程序的 pid 記在共享表 userPipes[me].pid[k]，讓對方在讀取完後（它的父流程）能精準 waitpid() 這個生產者，並做 FIFO 關閉/刪除等收尾。
     if (shouldSendUserPipe)
         userPipes[userId].pid[UserPipeDstId] = childpid;
+
+	// 沒有 >k，也不是 |N/!N 的情況（pipeTime == -1 表示「不是編號管線」）。「當下就該跑完」：因此同步等最後一個子程序結束，再印下一個 % 提示字元。
     else if (pipeTime == -1)
         waitpid(childpid, &waitStatus, 0);
+
+	// 有 |N/!N（pipeTime != -1），表示這些子程序的輸出被接到「未來第 N 行」才會讀的編號管線。所以這邊先不wait
     else
         numberedPipes[pipeTime].pids.push_back(childpid);
 
@@ -824,6 +837,8 @@ void ExecuteCommand(vector<vector<string>> &cmd, int pipeTime, string &line, int
     current_stderr = STDERR_FILENO;
 }
 
+// 出現 |N 或 !N，就把前面那一段子指令立即執行，並把它們的 stdout（和 !N 時的 stderr）接到一條「未來才讀」的管線
+// 剩下沒被 |N/!N 吃掉的尾段，留在 line 裡交給後續流程當「當下就執行」的指令
 void handleNumberedPipes(string &line, int userId)
 {
     int segmentStart = 0;     // 每段指令的起始位置
@@ -831,6 +846,7 @@ void handleNumberedPipes(string &line, int userId)
     int pipeTargetLine;       // 實際對應的未來執行位置
     int i = 0;                // 掃描 index
 
+	// 掃描整行，找 |N 或 !N
     while (i < line.size()) 
     {
         if (line[i] == '|' || line[i] == '!') 
@@ -895,6 +911,7 @@ void handleNumberedPipes(string &line, int userId)
     }
 }
 
+// 作為childprocess, 每個連線的child 都會執行以下的邏輯
 void serviceClient(int client_fd, int server_fd, struct sockaddr_in client_addr, int numUsers)
 {
     int i, n;
@@ -931,7 +948,10 @@ void serviceClient(int client_fd, int server_fd, struct sockaddr_in client_addr,
     // }
     memset(msg, '\0' ,sizeof(msg));
     broadcast = "*** User '" + string(usersData[numUsers].name) + "' entered from " + string(usersData[numUsers].ip4) + ":" + to_string(usersData[numUsers].port) + ". ***\n";
+	// 把字串複製到共享記憶體, 所有子行程都能看到同一塊 msg（shared memory）。
     strcpy(msg, broadcast.c_str());
+
+	// 發訊號通知所有線上使用者
     for(int i = 1; i < 31; i++)
     {
         if(usersData[i].exist)
@@ -950,6 +970,7 @@ void serviceClient(int client_fd, int server_fd, struct sockaddr_in client_addr,
     // 處理read fail的錯誤
     while (true) 
     {
+		// 讀輸入（可能一次讀多字或讀到多行）
         n = read(STDIN_FILENO, buf, MAXLINE);
         if (n == -1)
             continue;
@@ -958,6 +979,7 @@ void serviceClient(int client_fd, int server_fd, struct sockaddr_in client_addr,
         
         int execFlag = 0;
 
+		// 把本次讀到的 buf[0..n-1] 逐字處理，組成一行
         for(int j = 0; j < n; j++)
         {
             if(buf[j] == '\r')
@@ -970,12 +992,15 @@ void serviceClient(int client_fd, int server_fd, struct sockaddr_in client_addr,
             string line = curLine;
             curLine.clear();
 
+			// 先處理「編號管線」|N / !N
             handleNumberedPipes(line, numUsers);
             if (line.empty())
             {
                 cout << "% ";
                 continue;
             }
+
+			// 解析指令並檢查內建命令
             ParseInput(cmd, line);
             execFlag = buildInCommand(cmd, numUsers);
 
@@ -1062,6 +1087,9 @@ int main(int argc,char* argv[])
     signal(SIGUSR1, sigAtoBHandler);
     signal(SIGUSR2, sigFIFOHandler);
 
+	// std::cout／std::cerr 設成「每次輸出後自動 flush」的模式。
+	// std::ios::unitbuf 是 iostream 的一個 format flag（等同操作子 std::unitbuf）。
+	// 開啟後，該串流每次做完一次輸出動作就會立刻 flush 緩衝區，不用再手動寫 std::flush
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
     
@@ -1144,6 +1172,7 @@ int main(int argc,char* argv[])
     }
     // share memory
 
+	// 初始化共享記憶體裡的三塊資料：userPipes（使用者之間的 user pipe 狀態表）、usersData（線上使用者資料表）、msg（廣播/私訊用的訊息緩衝）。
     for(int i = 0; i < 31; i++)
     {
         for(int j = 0; j < 31; j++)
